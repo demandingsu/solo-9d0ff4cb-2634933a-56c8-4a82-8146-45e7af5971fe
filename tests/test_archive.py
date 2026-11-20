@@ -13,6 +13,7 @@ import unittest.mock
 
 from lake_archive import archive as store
 from lake_archive import csvio
+from lake_archive import verify
 from lake_archive.web import create_app
 
 CSV = b"""seq,sampled_at_utc,value_millidegrees_c,kind,base_seq
@@ -317,6 +318,197 @@ class TestPages(Base):
         page = self.client.get("/archives/%d" % aid).data.decode()
         self.assertNotIn("<script>alert(1)</script>", page)
         self.assertIn("&lt;script&gt;", page)
+
+
+class TestVerify(Base):
+    """Read-only reconciliation against the original import CSV."""
+
+    def verify(self, payload=CSV, filename="logger.csv"):
+        return verify.verify_archive(self.db, self.aid, payload, filename)
+
+    def report(self, payload=CSV):
+        r = self.client.post(
+            "/archives/%d/verify" % self.aid,
+            data={"file": (io.BytesIO(payload), "logger.csv")},
+            content_type="multipart/form-data")
+        return r
+
+    def test_untouched_archive_passes(self):
+        rep = self.verify()
+        self.assertTrue(rep.passed)
+        self.assertEqual(rep.revision_count, 0)
+        self.assertIsNone(rep.last_revision_id)
+        page = self.report().data.decode()
+        self.assertIn("核验通过", page)
+
+    def test_base_then_referrer_corrections_reconcile(self):
+        # Change the base first, then a frame that refers to it.  The second
+        # revision's stored difference must be priced against the base's
+        # reconstructed temperature at that moment (-2000), not the original
+        # one (-1500) nor anything current.
+        self.assertEqual(self.correct(1, seen=-1500, new=-2000).status_code, 302)
+        self.assertEqual(self.correct(2, seen=-1250, new=-900).status_code, 302)
+        rep = self.verify()
+        self.assertTrue(rep.passed, rep)
+        self.assertEqual(rep.last_revision_id, 2)
+        second = rep.revision_checks[1]
+        self.assertEqual(second.base_restored_mc, -2000)
+        self.assertEqual(second.expected_old_stored, ("delta", 750))
+        self.assertEqual(second.expected_new_stored, ("delta", 1100))
+        self.assertTrue(second.ok)
+
+    def test_ledger_uses_base_value_at_time_of_correction(self):
+        # Correct the referrer first (base still -1500), then the base
+        # (-2000).  The first revision's stored values stay priced at -1500.
+        self.correct(2, seen=-1250, new=-900)
+        self.correct(1, seen=-1500, new=-2000)
+        rep = self.verify()
+        self.assertTrue(rep.passed, rep)
+        first = rep.revision_checks[0]
+        self.assertEqual(first.base_restored_mc, -1500)
+        self.assertEqual(first.expected_old_stored, ("delta", 250))
+        self.assertEqual(first.expected_new_stored, ("delta", 600))
+        # The live *export* difference does move to 1100; the ledger is checked
+        # against the moment it was written, and the restored value is intact.
+        self.assertEqual(self.frame(2).stored_mc, 1100)
+
+    def test_original_frame_mismatch_reported_by_seq(self):
+        tampered = CSV.replace(b"3,2024-01-01T02:00:00Z,500,absolute,",
+                               b"3,2024-01-01T02:00:00Z,500,delta,1")
+        rep = self.verify(tampered)
+        self.assertFalse(rep.passed)
+        self.assertFalse(rep.structure_ok)
+        self.assertEqual([(i.seq, i.field) for i in rep.frame_issues], [(3, "base_seq")])
+        self.assertFalse(rep.restored_checked)
+        page = self.report(tampered).data.decode()
+        self.assertIn("基准引用与原件不符", page)
+
+    def test_missing_and_extra_frames_reported(self):
+        # Original names frames the archive no longer has.
+        extra_in_original = CSV + b"9,2024-01-01T08:00:00Z,10,absolute,\n"
+        rep = self.verify(extra_in_original)
+        self.assertEqual([(i.seq, i.field) for i in rep.frame_issues],
+                         [(9, "missing_in_current")])
+        # Archive holds a frame the original never had.
+        self._tamper(
+            "INSERT INTO frame (archive_id, seq, sampled_at, sampled_at_raw,"
+            " restored_mc, base_seq, kind_raw, extras_json)"
+            " VALUES (?, 9, '2024-01-01T08:00:00Z', '2024-01-01T08:00:00Z', 10,"
+            " NULL, '', '[]')", (self.aid,))
+        rep = self.verify()
+        self.assertEqual([(i.seq, i.field) for i in rep.frame_issues],
+                         [(9, "unexpected_in_current")])
+
+    def test_sampling_instant_mismatch_reported(self):
+        tampered = CSV.replace(b"2024-01-01T04:00:00Z", b"2024-01-01T05:00:00Z")
+        rep = self.verify(tampered)
+        self.assertEqual([(i.seq, i.field) for i in rep.frame_issues], [(5, "sampled_at")])
+
+    def _tamper(self, sql, params=()):
+        conn = store.connect(self.db)
+        try:
+            conn.execute(sql, params)
+        finally:
+            conn.close()
+
+    def test_wrong_ledger_delta_is_flagged_even_if_final_reading_matches(self):
+        self.correct(1, seen=-1500, new=-2000)
+        self.correct(2, seen=-1250, new=-1000)
+        # Live archive ends at -1000 and its difference derives from -2000;
+        # corrupt the audit row's recorded new stored value.
+        self._tamper("UPDATE revision SET new_stored_mc = 500 WHERE id = 2")
+        rep = self.verify()
+        self.assertFalse(rep.passed)
+        self.assertFalse(rep.revisions_ok)
+        self.assertEqual(rep.first_mismatch.revision_id, 2)
+        self.assertEqual(rep.restored_issues, ())  # readings still agree
+        page = self.report().data.decode()
+        self.assertIn("第 2 笔更正（帧 2）对不上", page)
+
+    def test_first_mismatch_is_reported_not_just_last(self):
+        self.correct(1, seen=-1500, new=-2000)         # revision 1
+        self.correct(2, seen=-1250, new=-900)          # revision 2
+        self.correct(3, seen=500, new=400)             # revision 3
+        self._tamper("UPDATE revision SET old_base_seq = 2 WHERE id = 3")
+        rep = self.verify()
+        self.assertFalse(rep.revisions_ok)
+        self.assertEqual(rep.first_mismatch.revision_id, 3)
+        self.assertEqual([c.revision_id for c in rep.revision_checks if not c.ok], [3])
+
+    def test_old_restored_mismatch_detected(self):
+        self.correct(2, seen=-1250, new=-900)
+        self._tamper("UPDATE revision SET old_restored_mc = -1200 WHERE id = 1")
+        rep = self.verify()
+        self.assertEqual(rep.first_mismatch.revision_id, 1)
+        fields = [i.field for i in rep.first_mismatch.issues]
+        self.assertIn("old_restored_mc", fields)
+        # The same row's old stored value is then inconsistent too.
+        self.assertIn("old_stored", fields)
+
+    def test_restored_mismatch_lists_frames_when_ledger_ok(self):
+        self.correct(1, seen=-1500, new=-2000)
+        self._tamper("UPDATE frame SET restored_mc = -1950 WHERE archive_id = 1 AND seq = 2")
+        rep = self.verify()
+        self.assertTrue(rep.revisions_ok)
+        self.assertTrue(rep.restored_checked)
+        self.assertEqual([(i.seq, i.reconstructed_mc, i.current_mc)
+                          for i in rep.restored_issues], [(2, -1250, -1950)])
+        page = self.report().data.decode()
+        self.assertIn("重建温度与现档不符", page)
+
+    def test_verify_is_read_only_and_records_nothing(self):
+        self.correct(1, seen=-1500, new=-2000)
+        before = self.download()
+        conn = store.connect(self.db)
+        try:
+            n_before = conn.execute("SELECT COUNT(*) FROM revision").fetchone()[0]
+        finally:
+            conn.close()
+        rep = self.verify()
+        self.assertTrue(rep.passed)
+        conn = store.connect(self.db)
+        try:
+            n_after = conn.execute("SELECT COUNT(*) FROM revision").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n_before, n_after)
+        self.assertEqual(self.download(), before)
+
+    def test_correction_during_verification_not_in_report(self):
+        self.correct(1, seen=-1500, new=-2000)
+        snapshot = verify.load_snapshot(self.db, self.aid)
+        # An operator keeps correcting while the report is being assembled.
+        self.correct(2, seen=-1250, new=-900)
+        rep = verify.analyze(snapshot, csvio.parse_csv(CSV)[0], "logger.csv")
+        self.assertEqual(rep.last_revision_id, 1)
+        self.assertEqual(rep.revision_count, 1)
+        self.assertTrue(rep.passed)
+        # The new state is captured by the next report.
+        again = self.verify()
+        self.assertEqual(again.last_revision_id, 2)
+        self.assertEqual(again.revision_count, 2)
+
+    def test_bad_original_csv_rejected_without_writes(self):
+        r = self.report(b"not,a,logger\n1,2,3\n")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("原件 CSV 无法读取", r.data.decode())
+
+    def test_missing_file_rejected(self):
+        r = self.client.post("/archives/%d/verify" % self.aid,
+                             data={}, content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 400)
+
+    def test_unknown_archive_404(self):
+        r = self.client.post("/archives/999/verify",
+                             data={"file": (io.BytesIO(CSV), "logger.csv")},
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 404)
+
+    def test_report_page_shows_last_revision_id(self):
+        self.correct(1, seen=-1500, new=-2000)
+        page = self.report().data.decode()
+        self.assertIn("末笔更正编号", page)
+        self.assertIn("<span class=\"mono\">1</span>", page)
 
 
 if __name__ == "__main__":

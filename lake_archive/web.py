@@ -7,6 +7,7 @@ import os
 from flask import Flask, Response, abort, redirect, request, url_for
 
 from . import archive as store
+from . import verify
 from . import views
 from .csvio import CsvFormatError
 
@@ -113,6 +114,29 @@ def create_app(db_path: str | None = None) -> Flask:
             abort(exc.status, exc.message)
         return redirect(url_for("show_frame", archive_id=archive_id, seq=seq,
                                 notice="更正已提交。", kind="ok"))
+
+    @app.post("/archives/<int:archive_id>/verify")
+    def verify_archive(archive_id: int):
+        upload_file = request.files.get("file")
+        if upload_file is None or not upload_file.filename:
+            return archive_response(archive_id, "请选择首次入档的记录仪 CSV。", "bad", 400)
+        try:
+            summary = store.get_archive(db(), archive_id)
+            report = verify.verify_archive(
+                db(), archive_id, upload_file.read(), upload_file.filename)
+        except CsvFormatError as exc:
+            return archive_response(archive_id, "原件 CSV 无法读取：%s" % exc, "bad", 400)
+        except store.ArchiveError as exc:
+            abort(exc.status, exc.message)
+        return views.verify_page(report)
+
+    def archive_response(archive_id: int, notice=None, kind="ok", status=200):
+        try:
+            summary = store.get_archive(db(), archive_id)
+            frames = store.list_frames(db(), archive_id)
+        except store.ArchiveError as exc:
+            abort(exc.status, exc.message)
+        return views.archive_page(summary, frames, notice, kind), status
 
     @app.get("/archives/<int:archive_id>/download.csv")
     def download(archive_id: int):

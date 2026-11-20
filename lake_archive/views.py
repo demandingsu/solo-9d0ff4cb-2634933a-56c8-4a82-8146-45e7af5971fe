@@ -5,10 +5,33 @@ from __future__ import annotations
 from html import escape
 
 from .archive import ArchiveSummary, FrameView
+from .verify import VerifyReport
 
 
 def _mc(value: int) -> str:
     return "%d m°C (%.3f °C)" % (value, value / 1000.0)
+
+
+def _stored_text(kind: str, value: int) -> str:
+    return "%s %d" % ("absolute" if kind == "absolute" else "delta", value)
+
+
+_FRAME_FIELDS = {
+    "missing_in_current": "现档缺少该帧",
+    "unexpected_in_current": "现档多出该帧",
+    "sampled_at": "采样时刻与原件不符",
+    "base_seq": "基准引用与原件不符",
+}
+
+_REVISION_FIELDS = {
+    "base_seq": "更正前基准引用",
+    "new_base_seq": "更正后基准引用",
+    "old_restored_mc": "更正前还原温度",
+    "old_stored": "更正前存储值",
+    "new_stored": "更正后存储值",
+    "missing_frame": "原件无此帧",
+    "missing_base": "原件无其基准帧",
+}
 
 
 STYLE = """
@@ -132,6 +155,18 @@ def archive_page(archive: ArchiveSummary, frames: list[FrameView],
         "<button type=\"submit\">查看该帧</button></form>" % archive.id
     )
 
+    parts.append("<h2>核验现档</h2>")
+    parts.append(
+        "<form class=\"card\" method=\"post\" action=\"/archives/%d/verify\""
+        " enctype=\"multipart/form-data\">"
+        "<label for=\"original\">首次入档的记录仪 CSV</label>"
+        "<input id=\"original\" name=\"file\" type=\"file\" accept=\".csv,text/csv\" required>"
+        "<p class=\"muted small\">从原始读数与历次更正出发，核对现档的帧号、采样时刻、"
+        "基准引用、每笔更正的还原温度与存储值，以及重建温度。核验只读，不写入任何数据，"
+        "期间可以继续更正。</p>"
+        "<button type=\"submit\">开始核验</button></form>" % archive.id
+    )
+
     trs = []
     for f in frames:
         base_cell = _fmt_opt(f.base_seq)
@@ -200,6 +235,150 @@ def frame_page(archive: ArchiveSummary, frame: FrameView, base: FrameView | None
            escape(_mc(frame.restored_mc)))
     )
     return _page("帧 %d" % frame.seq, "".join(parts))
+
+
+def _issue_value(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, tuple):
+        return _stored_text(value[0], value[1])
+    return str(value)
+
+
+def verify_page(report: VerifyReport, notice: str | None = None,
+                notice_kind: str = "ok") -> str:
+    parts = [
+        "<nav><a href=\"/\">全部档案</a> · <a href=\"/archives/%d\">%s</a></nav>"
+        % (report.archive_id, escape(report.archive_name)),
+        "<h1>核验报告</h1>",
+        "<div class=\"kv\">"
+        "<dt>档案</dt><dd>%s</dd>"
+        "<dt>原件</dt><dd class=\"mono\">%s</dd>"
+        "<dt>报告基准</dt><dd>同一已提交状态，末笔更正编号 <span class=\"mono\">%s</span>"
+        "（共 %d 笔）</dd>"
+        "<dt>帧数</dt><dd>原件 %d · 现档 %d</dd>"
+        "<dt>核验方式</dt><dd>只读；核验期间其他提交的更正不计入本报告</dd>"
+        "</div>" % (
+            escape(report.archive_name),
+            escape(report.original_filename or "（未记录文件名）"),
+            "—" if report.last_revision_id is None else str(report.last_revision_id),
+            report.revision_count, report.original_frame_count,
+            report.current_frame_count,
+        ),
+    ]
+    if notice:
+        parts.append("<div class=\"notice %s\">%s</div>" % (escape(notice_kind), escape(notice)))
+
+    if report.passed:
+        parts.append("<div class=\"notice ok\"><strong>核验通过。</strong>"
+                     "现档的帧号、采样时刻、基准引用、历次更正与重建温度均与原件相符。</div>")
+    elif not report.structure_ok:
+        parts.append("<div class=\"notice bad\"><strong>核验未通过：原件与现档的帧结构不符。</strong>"
+                     "见下方相关帧号。</div>")
+    elif not report.revisions_ok:
+        fm = report.first_mismatch
+        parts.append(
+            "<div class=\"notice bad\"><strong>核验未通过：第 %d 笔更正（帧 %d）对不上。</strong>"
+            "即使现档最终读数吻合，账目也有误。</div>" % (fm.revision_id, fm.seq))
+    else:
+        parts.append("<div class=\"notice bad\"><strong>核验未通过：重建温度与现档不符。</strong>"
+                     "见下方帧列表。</div>")
+
+    # 1. structure
+    parts.append("<h2>一、原件与现档的帧结构</h2>")
+    if report.structure_ok:
+        parts.append("<p class=\"notice ok\">帧号、采样时刻、基准引用全部相符。</p>")
+    else:
+        rows = []
+        for iss in report.frame_issues:
+            rows.append(
+                "<tr class=\"stale\"><td>%d</td><td>%s</td><td class=\"mono\">%s</td>"
+                "<td class=\"mono\">%s</td></tr>"
+                % (iss.seq, escape(_FRAME_FIELDS.get(iss.field, iss.field)),
+                   escape(_issue_value(iss.original)),
+                   escape(_issue_value(iss.current)))
+            )
+        parts.append(
+            "<table><thead><tr><th>帧号</th><th>问题</th><th>原件</th><th>现档</th></tr>"
+            "</thead><tbody>%s</tbody></table>" % "".join(rows))
+
+    # 2. revisions
+    parts.append("<h2>二、历次更正的账目</h2>")
+    if not report.revision_checks:
+        parts.append("<p class=\"muted\">该档案还没有更正记录。</p>")
+    else:
+        if report.revisions_ok:
+            parts.append("<p class=\"notice ok\">%d 笔更正的基准引用、还原温度与存储值全部相符。</p>"
+                         % len(report.revision_checks))
+        else:
+            fm = report.first_mismatch
+            parts.append(
+                "<p class=\"notice bad\">第一笔对不上的更正：编号 <span class=\"mono\">%d</span>"
+                "（帧 %d）。</p>" % (fm.revision_id, fm.seq))
+        rows = []
+        for chk in report.revision_checks:
+            base_txt = "—"
+            if chk.base_seq is not None:
+                base_txt = "帧 %d（当时还原 %s）" % (
+                    chk.base_seq,
+                    "—" if chk.base_restored_mc is None
+                    else _mc(chk.base_restored_mc))
+            old_exp = "—" if chk.expected_old_stored is None else \
+                _stored_text(*chk.expected_old_stored)
+            new_exp = "—" if chk.expected_new_stored is None else \
+                _stored_text(*chk.expected_new_stored)
+            if chk.ok:
+                verdict = "<span style=\"color:var(--ok)\">相符</span>"
+                detail = ""
+            else:
+                verdict = "<span style=\"color:var(--bad)\">不符</span>"
+                detail = "；".join(
+                    "%s：应为 %s，账记 %s" % (
+                        _REVISION_FIELDS.get(i.field, i.field),
+                        _issue_value(i.expected), _issue_value(i.recorded))
+                    for i in chk.issues)
+                detail = "<br><span class=\"small\">%s</span>" % escape(detail)
+            rows.append(
+                "<tr%s><td class=\"mono\">%d</td><td><a href=\"/archives/%d/frames/%d\">%d</a></td>"
+                "<td class=\"small\">%s</td>"
+                "<td class=\"mono\">%s<br>→ %s</td>"
+                "<td class=\"mono\">%s<br>→ %s</td>"
+                "<td>%s%s</td></tr>"
+                % (" class=\"stale\"" if not chk.ok else "",
+                   chk.revision_id, report.archive_id, chk.seq, chk.seq, escape(base_txt),
+                   escape(_mc(chk.old_restored_mc)), escape(_mc(chk.new_restored_mc)),
+                   escape(old_exp), escape(new_exp), verdict, detail)
+            )
+        parts.append(
+            "<table><thead><tr><th>更正编号</th><th>帧</th><th>基准（当时）</th>"
+            "<th>还原温度 前→后</th><th>存储值 前→后（应）</th><th>结论</th></tr>"
+            "</thead><tbody>%s</tbody></table>" % "".join(rows))
+
+    # 3. reconstructed restored values
+    parts.append("<h2>三、重建温度与现档</h2>")
+    if not report.restored_checked:
+        if not report.structure_ok:
+            parts.append("<p class=\"muted\">帧结构与原件不符，未进入重建温度核对。</p>")
+        else:
+            parts.append("<p class=\"muted\">更正账目有误，未进入重建温度核对。</p>")
+    elif not report.restored_issues:
+        parts.append("<p class=\"notice ok\">重建温度与现档逐帧相符。</p>")
+    else:
+        rows = []
+        for iss in report.restored_issues:
+            rows.append(
+                "<tr class=\"stale\"><td><a href=\"/archives/%d/frames/%d\">%d</a></td>"
+                "<td class=\"mono\">%s</td><td class=\"mono\">%s</td>"
+                "<td class=\"mono\">%d</td></tr>"
+                % (report.archive_id, iss.seq, iss.seq, escape(_mc(iss.reconstructed_mc)),
+                   escape(_mc(iss.current_mc)),
+                   iss.current_mc - iss.reconstructed_mc)
+            )
+        parts.append(
+            "<table><thead><tr><th>帧号</th><th>重建温度</th><th>现档温度</th>"
+            "<th>差（m°C）</th></tr></thead><tbody>%s</tbody></table>" % "".join(rows))
+
+    return _page("核验报告 · %s" % report.archive_name, "".join(parts))
 
 
 def error_page(status: int, message: str) -> str:
